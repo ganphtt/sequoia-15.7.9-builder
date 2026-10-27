@@ -1,0 +1,65 @@
+name: Authenticated transfer preflight
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  deployments: write
+jobs:
+  transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify local security tests
+        run: python3 scripts/test_transfer.py
+      - name: Serve tiny fixture through bounded Quick Tunnel
+        env:
+          TRANSFER_TOKEN: ${{ secrets.TRANSFER_PREFLIGHT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work=$(mktemp -d)
+          server_pid=''; tunnel_pid=''; deployment=''
+          cleanup() {
+            trap - EXIT INT TERM
+            [ -z "$tunnel_pid" ] || kill "$tunnel_pid" 2>/dev/null || true
+            [ -z "$server_pid" ] || kill "$server_pid" 2>/dev/null || true
+            wait 2>/dev/null || true
+            if [ -n "$deployment" ]; then
+              gh api -X POST "repos/$GITHUB_REPOSITORY/deployments/$deployment/statuses" -f state=inactive >/dev/null || true
+            fi
+            rm -rf "$work"
+            printf 'TRANSFER_CLEANUP_COMPLETE\n'
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT TERM
+          mkdir "$work/public"
+          python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(bytes(range(256))*4096)' "$work/public/fixture.bin"
+          sha256sum "$work/public/fixture.bin"
+          curl --fail --silent --show-error --location --retry 2 https://github.com/cloudflare/cloudflared/releases/download/2026.10.5/cloudflared-linux-amd64 -o "$work/cloudflared"
+          printf '%s  %s\n' e1bc0cf084fd9e590554fe769a86b1db46701c3f847a43d902f7b974a4e16298 "$work/cloudflared" | sha256sum --check
+          chmod 700 "$work/cloudflared"
+          python3 scripts/transfer_server.py "$work/public" 18765 &
+          server_pid=$!
+          unset TRANSFER_TOKEN
+          "$work/cloudflared" tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:18765 >"$work/tunnel.log" 2>&1 &
+          tunnel_pid=$!
+          for attempt in {1..60}; do
+            url=$(python3 -c 'import re,sys; m=re.search(r"https://[a-z0-9-]+\.trycloudflare\.com",open(sys.argv[1]).read()); print(m[0] if m else "")' "$work/tunnel.log")
+            [ -z "$url" ] || break
+            kill -0 "$tunnel_pid"
+            sleep 2
+          done
+          test -n "$url"
+          printf 'TRANSFER_URL=%s\n' "$url"
+          deployment=$(gh api -X POST "repos/$GITHUB_REPOSITORY/deployments" --input <(python3 -c 'import json,os; print(json.dumps({"ref":os.environ["GITHUB_SHA"],"environment":"transfer-preflight","auto_merge":False,"required_contexts":[],"transient_environment":True,"production_environment":False,"description":"Small-file preflight run "+os.environ["GITHUB_RUN_ID"]}))') --jq .id)
+          gh api -X POST "repos/$GITHUB_REPOSITORY/deployments/$deployment/statuses" -f state=in_progress -f environment_url="$url" -f log_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >/dev/null
+          # Discovery via deployment metadata avoids waiting for completed job logs.
+          for attempt in {1..240}; do
+            kill -0 "$server_pid"; kill -0 "$tunnel_pid"
+            sleep 2
+          done
