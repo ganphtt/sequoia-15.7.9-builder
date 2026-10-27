@@ -1,0 +1,21 @@
+name: Exact Sequoia installer preflight
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: sequoia-preflight
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Check Intel host and exact official source
+        run: bash scripts/preflight.sh
+      - name: Explain delivery gate
+        run: |
+          printf '%s\n' 'Preflight only: no installer was built.' 'A private authenticated delivery destination must be approved before enabling the full build job. No binary artifacts, caches, or releases are uploaded.' >> "$GITHUB_STEP_SUMMARY"
